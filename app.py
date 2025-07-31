@@ -1,4 +1,4 @@
-from flask import Flask, render_template, request, redirect, url_for, session
+import gradio as gr
 import soundfile as sf
 import numpy as np
 import librosa
@@ -9,18 +9,12 @@ import joblib
 import os
 from datetime import datetime
 
-app = Flask(__name__)
-app.secret_key = 'supersecretkey'
-
 # Load model default dan scaler
 scaler = joblib.load('dataset/scaler_hybrid.pkl')
-label_encoder = joblib.load('dataset/onehotencoder.pkl')  # ganti dengan OneHotEncoder
+label_encoder = joblib.load('dataset/onehotencoder.pkl')
 emotion_labels = label_encoder.categories_[0].tolist()
 
 # File dan path
-temp_audio_path = 'static/audio.wav'
-temp_upload_path = 'static/uploaded_audio.wav'
-last_audio_path = 'static/audio_last.wav'
 fs = 22050
 
 # Peta model
@@ -63,140 +57,117 @@ def extract_cochleagram(y, sr):
     cochleagram_mean = np.mean(cochleagram, axis=1)
     return cochleagram_mean[:40]
 
-def extract_hybrid_features(filename):
+def extract_hybrid_features(audio_data):
     try:
-        y, sr = librosa.load(filename, sr=fs)
+        # Convert audio data to numpy array
+        if isinstance(audio_data, tuple):
+            y, sr = audio_data
+        else:
+            y, sr = librosa.load(audio_data, sr=fs)
+        
         if len(y) < 10000:
-            print("Audio terlalu pendek.")
-            return None
+            return None, "Audio terlalu pendek."
+        
         if len(y) > sr * 5:
             start = (len(y) - sr * 5) // 2
             y = y[start:start + sr * 5]
+        
         mfcc = extract_mfcc(y, sr)
         hilbert_features = extract_hilbert(y)
         cochleagram_features = extract_cochleagram(y, sr)
-        return np.concatenate((mfcc, hilbert_features, cochleagram_features), axis=0)
+        return np.concatenate((mfcc, hilbert_features, cochleagram_features), axis=0), None
     except Exception as e:
-        print(f"Ekstraksi fitur gagal: {e}")
-        return None
+        return None, f"Ekstraksi fitur gagal: {e}"
 
-def add_history(emotion, accuracy, tipe, model_choice, filename=''):
-    history = session.get('history', [])
-    history.append({
-        'emotion': emotion,
-        'accuracy': round(accuracy * 100, 2),
-        'tipe': tipe,
-        'model': model_choice,
-        'filename': filename,
-        'waktu': datetime.now().strftime('%d-%m-%Y %H:%M:%S')
-    })
-    session['history'] = history
-
-@app.route('/')
-def index():
-    return render_template('indexExperiment.html', history=session.get('history', []))
-
-@app.route('/record', methods=['POST'])
-def record():
+def predict_emotion(audio, model_choice="hybrid"):
+    """Fungsi prediksi untuk Gradio"""
     try:
-        model_choice = request.form.get('model_choice', 'hybrid')
-        if 'audio' not in request.files:
-            return redirect(url_for('result', emotion='Error', accuracy=0, error='Audio tidak ditemukan.'))
-
-        audio_file = request.files['audio']
-        audio_file.save(temp_audio_path)
-        with open(temp_audio_path, 'rb') as src, open(last_audio_path, 'wb') as dst:
-            dst.write(src.read())
-
-        y, sr = librosa.load(temp_audio_path, sr=fs)
-        if librosa.get_duration(y=y, sr=sr) < 2.0:
-            os.remove(temp_audio_path)
-            return redirect(url_for('result', emotion='Error', accuracy=0, error='Audio terlalu singkat. Minimal 2 detik.'))
-
-        features = extract_hybrid_features(temp_audio_path)
+        if audio is None:
+            return "Error: Tidak ada audio yang diberikan.", 0.0
+        
+        # Extract features
+        features, error = extract_hybrid_features(audio)
         if features is None:
-            return redirect(url_for('result', emotion='Error', accuracy=0, error='Ekstraksi fitur gagal.'))
-
+            return error, 0.0
+        
+        # Preprocess features
         features = scaler.transform([features])[0]
         features = np.expand_dims(features, axis=0)
         features = np.expand_dims(features, axis=-1)
-
+        
+        # Predict
         model = get_model(model_choice)
         prediction = model.predict(features)
         emotion_index = np.argmax(prediction)
-
+        
+        # Decode emotion
         one_hot = np.zeros((1, len(emotion_labels)))
         one_hot[0, emotion_index] = 1
         emotion_arr = label_encoder.inverse_transform(one_hot)
         emotion = emotion_arr[0] if isinstance(emotion_arr[0], str) else emotion_arr[0][0]
-
+        
         accuracy = float(prediction[0][emotion_index])
-        add_history(emotion, accuracy, 'Rekaman', model_choice, 'Rekaman Audio')
-        return redirect(url_for('result', emotion=emotion, accuracy=accuracy))
+        
+        return f"Emosi: {emotion}", accuracy * 100
     except Exception as e:
-        print(f"Error during record: {e}")
-        return redirect(url_for('result', emotion='Error', accuracy=0, error='Terjadi error saat rekam.'))
+        return f"Error: {str(e)}", 0.0
 
-@app.route('/upload', methods=['POST'])
-def upload():
-    try:
-        model_choice = request.form.get('model_choice', 'hybrid')
-        if 'file' not in request.files:
-            return redirect(url_for('result', emotion='Error', accuracy=0, error='File audio tidak ditemukan.'))
+# Create Gradio interface
+def create_interface():
+    with gr.Blocks(title="Speech Emotion Recognition", theme=gr.themes.Soft()) as demo:
+        gr.Markdown("# 🎤 Speech Emotion Recognition")
+        gr.Markdown("Aplikasi pengenalan emosi dari suara menggunakan model deep learning hybrid")
+        
+        with gr.Row():
+            with gr.Column():
+                gr.Markdown("### 📝 Pilih Model")
+                model_choice = gr.Dropdown(
+                    choices=["hybrid", "cnn", "lstm"],
+                    value="hybrid",
+                    label="Model yang digunakan"
+                )
+                
+                gr.Markdown("### 🎙️ Rekam Audio")
+                audio_input = gr.Audio(
+                    sources=["microphone", "upload"],
+                    type="filepath",
+                    label="Rekam atau upload audio (.wav)"
+                )
+                
+                predict_btn = gr.Button("🔍 Prediksi Emosi", variant="primary")
+            
+            with gr.Column():
+                gr.Markdown("### 📊 Hasil Prediksi")
+                emotion_output = gr.Textbox(label="Hasil Emosi", interactive=False)
+                accuracy_output = gr.Slider(
+                    minimum=0, maximum=100, value=0, 
+                    label="Akurasi (%)", interactive=False
+                )
+                
+                gr.Markdown("### 📈 Informasi")
+                info_text = gr.Markdown("""
+                **Cara menggunakan:**
+                1. Pilih model yang ingin digunakan
+                2. Rekam audio atau upload file .wav
+                3. Klik tombol "Prediksi Emosi"
+                4. Lihat hasil prediksi dan akurasi
+                
+                **Tips:**
+                - Audio minimal 2 detik
+                - Format file: .wav
+                - Pastikan audio jelas dan tidak berisik
+                """)
+        
+        # Connect components
+        predict_btn.click(
+            fn=predict_emotion,
+            inputs=[audio_input, model_choice],
+            outputs=[emotion_output, accuracy_output]
+        )
+    
+    return demo
 
-        file = request.files['file']
-        if file.filename == '' or not file.filename.lower().endswith('.wav'):
-            return redirect(url_for('result', emotion='Error', accuracy=0, error='Format file harus .wav.'))
-
-        file.save(temp_upload_path)
-        y, sr = librosa.load(temp_upload_path, sr=fs)
-        if librosa.get_duration(y=y, sr=sr) < 2.0:
-            os.remove(temp_upload_path)
-            return redirect(url_for('result', emotion='Error', accuracy=0, error='Audio terlalu singkat. Minimal 2 detik.'))
-
-        with open(temp_upload_path, 'rb') as src, open(last_audio_path, 'wb') as dst:
-            dst.write(src.read())
-
-        features = extract_hybrid_features(temp_upload_path)
-        if features is None:
-            return redirect(url_for('result', emotion='Error', accuracy=0, error='Ekstraksi fitur gagal.'))
-
-        features = scaler.transform([features])[0]
-        features = np.expand_dims(features, axis=0)
-        features = np.expand_dims(features, axis=-1)
-
-        model = get_model(model_choice)
-        prediction = model.predict(features)
-        emotion_index = np.argmax(prediction)
-
-        one_hot = np.zeros((1, len(emotion_labels)))
-        one_hot[0, emotion_index] = 1
-        emotion_arr = label_encoder.inverse_transform(one_hot)
-        emotion = emotion_arr[0] if isinstance(emotion_arr[0], str) else emotion_arr[0][0]
-
-        accuracy = float(prediction[0][emotion_index])
-        os.remove(temp_upload_path)
-        add_history(emotion, accuracy, 'Upload', model_choice, file.filename)
-        return redirect(url_for('result', emotion=emotion, accuracy=accuracy))
-    except Exception as e:
-        print(f"Error during upload: {e}")
-        return redirect(url_for('result', emotion='Error', accuracy=0, error='Terjadi error saat upload.'))
-
-@app.route('/result/<emotion>/<float:accuracy>')
-def result(emotion, accuracy):
-    return render_template('indexExperiment.html',
-        emotion=emotion,
-        accuracy=round(accuracy * 100, 2),
-        error=request.args.get('error'),
-        audio_last_path=last_audio_path if os.path.exists(last_audio_path) else None,
-        history=session.get('history', [])
-    )
-
-@app.route('/reset_history', methods=['POST'])
-def reset_history():
-    session.pop('history', None)
-    return redirect(url_for('index'))
-
-if __name__ == '__main__':
-    port = int(os.environ.get('PORT', 5000))
-    app.run(host='0.0.0.0', port=port, debug=False)
+# Launch app
+if __name__ == "__main__":
+    demo = create_interface()
+    demo.launch()
